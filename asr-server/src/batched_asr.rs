@@ -2,7 +2,7 @@
 // This source code is licensed under the license found in the
 // LICENSE file in the root directory of this source tree.
 
-use crate::asr::{InMsg, OutMsg};
+use crate::asr::{word_ends_segment, InMsg, OutMsg, SEGMENT_GAP_SECONDS};
 use crate::metrics::asr as metrics;
 use crate::AsrStreamingQuery as Query;
 use anyhow::{Context, Result};
@@ -66,13 +66,28 @@ struct Channel {
     data: VecDeque<f32>,
     decoder: kaudio::ogg_opus::Decoder,
     steps: usize,
+    segment_start: Option<f64>,
+    last_word_start: Option<f64>,
+    last_word_stop: Option<f64>,
+    segment_words: Vec<String>,
 }
 
 impl Channel {
     fn new(in_rx: InRecv, out_tx: OutSend) -> Result<Self> {
         metrics::OPEN_CHANNELS.inc();
         let decoder = kaudio::ogg_opus::Decoder::new(24000, FRAME_SIZE)?;
-        Ok(Self { id: ChannelId::new(), in_rx, out_tx, data: VecDeque::new(), decoder, steps: 0 })
+        Ok(Self {
+            id: ChannelId::new(),
+            in_rx,
+            out_tx,
+            data: VecDeque::new(),
+            decoder,
+            steps: 0,
+            segment_start: None,
+            last_word_start: None,
+            last_word_stop: None,
+            segment_words: Vec::new(),
+        })
     }
 
     fn extend_data(&mut self, mut pcm: Vec<f32>) -> Option<Vec<f32>> {
@@ -97,6 +112,30 @@ impl Channel {
             return Ok(());
         }
         self.out_tx.send(msg)?;
+        Ok(())
+    }
+
+    fn emit_segment(&mut self, approx_end: f64, ref_channel_id: Option<ChannelId>) -> Result<()> {
+        if self.segment_words.is_empty() {
+            return Ok(());
+        }
+        if let Some(seg_start) = self.segment_start {
+            let mut segment_end = self.last_word_stop.unwrap_or(approx_end);
+            if segment_end < seg_start {
+                segment_end = seg_start;
+            }
+            let text_segment = self.segment_words.join(" ");
+            let segment = OutMsg::Segment {
+                start_time: seg_start,
+                end_time: segment_end,
+                text: text_segment,
+            };
+            self.send(segment, ref_channel_id)?;
+        }
+        self.segment_words.clear();
+        self.segment_start = None;
+        self.last_word_start = None;
+        self.last_word_stop = None;
         Ok(())
     }
 }
@@ -388,19 +427,51 @@ impl BatchedAsrInner {
                 asr_core::asr::AsrMsg::Word { tokens, start_time, batch_idx } => {
                     let text = self.text_tokenizer.decode_piece_ids(&tokens)?;
                     tracing::info!(batch_idx, start_time, text = %text, "asr word");
-                    let msg = OutMsg::Word { text, start_time };
-                    if let Some(c) = channels[batch_idx].as_ref() {
-                        if c.send(msg, ref_channel_ids[batch_idx]).is_err() {
-                            channels[batch_idx] = None;
+                    let mut remove_channel = false;
+                    if let Some(c) = channels[batch_idx].as_mut() {
+                        if let Some(prev_start) = c.last_word_start {
+                            let gap = start_time - prev_start;
+                            if gap.is_finite() && gap >= SEGMENT_GAP_SECONDS {
+                                if c.emit_segment(prev_start, ref_channel_ids[batch_idx]).is_err() {
+                                    remove_channel = true;
+                                }
+                            }
                         }
+
+                        if c.segment_start.is_none() {
+                            c.segment_start = Some(start_time);
+                        }
+                        c.segment_words.push(text.clone());
+                        c.last_word_start = Some(start_time);
+                        if !remove_channel {
+                            let msg = OutMsg::Word { text: text.clone(), start_time };
+                            if c.send(msg, ref_channel_ids[batch_idx]).is_err() {
+                                remove_channel = true;
+                            }
+                        }
+                        if !remove_channel && word_ends_segment(&text) {
+                            if c.emit_segment(start_time, ref_channel_ids[batch_idx]).is_err() {
+                                remove_channel = true;
+                            }
+                        }
+                    }
+                    if remove_channel {
+                        channels[batch_idx] = None;
                     }
                 }
                 asr_core::asr::AsrMsg::EndWord { stop_time, batch_idx } => {
-                    let msg = OutMsg::EndWord { stop_time };
-                    if let Some(c) = channels[batch_idx].as_ref() {
-                        if c.send(msg, ref_channel_ids[batch_idx]).is_err() {
-                            channels[batch_idx] = None;
+                    let mut remove_channel = false;
+                    if let Some(c) = channels[batch_idx].as_mut() {
+                        if c.segment_start.is_some() && !c.segment_words.is_empty() {
+                            c.last_word_stop = Some(stop_time);
                         }
+                        let msg = OutMsg::EndWord { stop_time };
+                        if c.send(msg, ref_channel_ids[batch_idx]).is_err() {
+                            remove_channel = true;
+                        }
+                    }
+                    if remove_channel {
+                        channels[batch_idx] = None;
                     }
                 }
                 asr_core::asr::AsrMsg::Step { step_idx, prs } => {
@@ -421,10 +492,30 @@ impl BatchedAsrInner {
         }
         while let Some(m) = markers.peek() {
             if m.step_idx <= step_idx {
-                if let Some(c) = channels[m.batch_idx].as_ref() {
-                    if c.send(OutMsg::Marker { id: m.marker_id }, Some(m.channel_id)).is_err() {
-                        channels[m.batch_idx] = None;
+                let mut remove_channel = false;
+                {
+                    if let Some(c) = channels[m.batch_idx].as_mut() {
+                        if let Some(last_start) = c.last_word_start {
+                            if c.emit_segment(
+                                c.last_word_stop.unwrap_or(last_start),
+                                Some(m.channel_id),
+                            )
+                            .is_err()
+                            {
+                                remove_channel = true;
+                            }
+                        }
+                        if !remove_channel {
+                            if c.send(OutMsg::Marker { id: m.marker_id }, Some(m.channel_id))
+                                .is_err()
+                            {
+                                remove_channel = true;
+                            }
+                        }
                     }
+                }
+                if remove_channel {
+                    channels[m.batch_idx] = None;
                 }
                 markers.pop();
             } else {
@@ -559,9 +650,10 @@ impl BatchedAsr {
         while let Some(msg) = out_rx.recv().await {
             match msg {
                 OutMsg::Marker { .. } => break,
-                OutMsg::Error { .. } | OutMsg::Word { .. } | OutMsg::EndWord { .. } => {
-                    msgs.push(msg)
-                }
+                OutMsg::Error { .. }
+                | OutMsg::Word { .. }
+                | OutMsg::EndWord { .. }
+                | OutMsg::Segment { .. } => msgs.push(msg),
                 OutMsg::Ready | OutMsg::Step { .. } => {}
             }
         }

@@ -12,6 +12,27 @@ use std::collections::VecDeque;
 use tokio::time::{timeout, Duration};
 
 const FRAME_SIZE: usize = 1920;
+pub const SEGMENT_GAP_SECONDS: f64 = 1.2;
+
+const SENTENCE_ENDING_PUNCTUATION: [char; 3] = ['.', '!', '?'];
+const TRAILING_WRAPPERS: [char; 5] = ['"', '\'', ')', ']', '}'];
+const NON_BREAKING_ABBREVIATIONS: &[&str] = &[
+    "dr.", "drs.", "mr.", "mrs.", "ms.", "prof.", "sr.", "jr.", "st.", "vs.", "etc.", "e.g.",
+    "i.e.", "cf.",
+];
+
+#[inline]
+pub fn word_ends_segment(word: &str) -> bool {
+    let trimmed = word.trim_end_matches(|c| TRAILING_WRAPPERS.contains(&c));
+    let Some(last_char) = trimmed.chars().next_back() else {
+        return false;
+    };
+    if !SENTENCE_ENDING_PUNCTUATION.contains(&last_char) {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    !NON_BREAKING_ABBREVIATIONS.iter().any(|abbr| *abbr == lower)
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
@@ -53,6 +74,7 @@ pub enum OutMsg {
     Step { step_idx: usize, prs: Vec<f32>, buffered_pcm: usize },
     Error { message: String },
     Ready,
+    Segment { start_time: f64, end_time: f64, text: String },
 }
 
 #[derive(Debug)]
@@ -167,6 +189,40 @@ impl Asr {
             let dev = state.device().clone();
             // Store the markers in a double ended queue
             let mut markers = VecDeque::new();
+            let mut segment_start: Option<f64> = None;
+            let mut last_word_start: Option<f64> = None;
+            let mut last_word_stop: Option<f64> = None;
+            let mut segment_words: Vec<String> = Vec::new();
+
+            fn emit_segment(
+                tx: &tokio::sync::mpsc::UnboundedSender<OutMsg>,
+                segment_start: &mut Option<f64>,
+                segment_words: &mut Vec<String>,
+                last_word_start: &mut Option<f64>,
+                last_word_stop: &mut Option<f64>,
+                approx_end: f64,
+            ) -> Result<()> {
+                if segment_words.is_empty() {
+                    return Ok(());
+                }
+                if let Some(seg_start) = *segment_start {
+                    let mut segment_end = (*last_word_stop).unwrap_or(approx_end);
+                    if segment_end < seg_start {
+                        segment_end = seg_start;
+                    }
+                    let text_segment = segment_words.join(" ");
+                    tx.send(OutMsg::Segment {
+                        start_time: seg_start,
+                        end_time: segment_end,
+                        text: text_segment,
+                    })?;
+                }
+                segment_words.clear();
+                *segment_start = None;
+                *last_word_start = None;
+                *last_word_stop = None;
+                Ok(())
+            }
             while let Some(msg) = receiver.next().await {
                 let msg = match msg? {
                     ws::Message::Binary(x) => x,
@@ -214,11 +270,37 @@ impl Asr {
                         },
                     )?;
                     for asr_msg in asr_msgs.into_iter() {
-                        let msg = match asr_msg {
+                        match asr_msg {
                             asr_core::asr::AsrMsg::Word { tokens, start_time, .. } => {
-                                OutMsg::Word {
-                                    text: text_tokenizer.decode_piece_ids(&tokens)?,
-                                    start_time,
+                                let text = text_tokenizer.decode_piece_ids(&tokens)?;
+                                if let Some(prev_start) = last_word_start {
+                                    let gap = start_time - prev_start;
+                                    if gap.is_finite() && gap >= SEGMENT_GAP_SECONDS {
+                                        emit_segment(
+                                            &tx,
+                                            &mut segment_start,
+                                            &mut segment_words,
+                                            &mut last_word_start,
+                                            &mut last_word_stop,
+                                            prev_start,
+                                        )?;
+                                    }
+                                }
+                                if segment_start.is_none() {
+                                    segment_start = Some(start_time);
+                                }
+                                segment_words.push(text.clone());
+                                last_word_start = Some(start_time);
+                                tx.send(OutMsg::Word { text: text.clone(), start_time })?;
+                                if word_ends_segment(&text) {
+                                    emit_segment(
+                                        &tx,
+                                        &mut segment_start,
+                                        &mut segment_words,
+                                        &mut last_word_start,
+                                        &mut last_word_stop,
+                                        start_time,
+                                    )?;
                                 }
                             }
                             asr_core::asr::AsrMsg::Step { step_idx, prs } => {
@@ -226,13 +308,15 @@ impl Asr {
                                     continue;
                                 }
                                 let prs = prs.iter().map(|p| p[0]).collect::<Vec<_>>();
-                                OutMsg::Step { step_idx, prs, buffered_pcm: 0 }
+                                tx.send(OutMsg::Step { step_idx, prs, buffered_pcm: 0 })?;
                             }
                             asr_core::asr::AsrMsg::EndWord { stop_time, .. } => {
-                                OutMsg::EndWord { stop_time }
+                                if segment_start.is_some() && !segment_words.is_empty() {
+                                    last_word_stop = Some(stop_time);
+                                }
+                                tx.send(OutMsg::EndWord { stop_time })?;
                             }
-                        };
-                        tx.send(msg)?
+                        }
                     }
                     while let Some((step_idx, id)) = markers.front() {
                         if *step_idx + asr_delay_in_tokens <= state.model_step_idx() {
@@ -243,6 +327,17 @@ impl Asr {
                         }
                     }
                 }
+            }
+            if !segment_words.is_empty() {
+                let approx_end = last_word_stop.or(last_word_start).unwrap_or_default();
+                emit_segment(
+                    &tx,
+                    &mut segment_start,
+                    &mut segment_words,
+                    &mut last_word_start,
+                    &mut last_word_stop,
+                    approx_end,
+                )?;
             }
             Ok::<(), anyhow::Error>(())
         });
